@@ -238,10 +238,14 @@ def compute_ensemble_stats(ds):
 
 
 def get_city_forecast(ds_display, lead_time_hr):
+    # Only show meaningful variables, not raw u10m/v10m
+    show_vars = ["t2m", "tp", "wind_speed", "r2m", "msl"]
     rows = []
     for city, (lat, lon) in PAKISTAN_CITIES.items():
         row = {"City": city}
-        for var in ds_display.data_vars:
+        for var in show_vars:
+            if var not in ds_display:
+                continue
             info = VARIABLE_INFO.get(var, {"name": var, "unit": ""})
             try:
                 val = ds_display[var].sel(lat=lat, lon=lon, method="nearest")
