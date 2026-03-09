@@ -1,19 +1,16 @@
 """
 earth2studio_fetch.py
-Fetches live weather data from NOAA GFS/GEFS via NVIDIA Earth2Studio.
-Uses subprocess to avoid Streamlit async event loop conflicts.
-No GPU required.
+Fetches GFS weather data directly from NOAA via plain HTTP.
+No async, no S3 client, no event loop issues. Works everywhere.
 """
 
 import numpy as np
 import xarray as xr
 import streamlit as st
 import os
-import sys
-import json
 import hashlib
-import subprocess
 import tempfile
+import urllib.request
 from datetime import datetime, timedelta
 
 # Pakistan region bounds
@@ -22,9 +19,15 @@ PK_LAT_MAX = 37.0
 PK_LON_MIN = 61.0
 PK_LON_MAX = 77.0
 
-# GFS has tp (precipitation), GEFS does not
-GFS_VARIABLES = ["t2m", "tp", "u10m", "v10m", "r2m", "msl"]
-GEFS_VARIABLES = ["t2m", "u10m", "v10m", "r2m", "msl", "d2m"]
+# GFS index patterns for each variable
+GFS_IDX_PATTERNS = {
+    "t2m": "TMP:2 m above ground",
+    "tp": "APCP:surface",
+    "u10m": "UGRD:10 m above ground",
+    "v10m": "VGRD:10 m above ground",
+    "r2m": "RH:2 m above ground",
+    "msl": "PRMSL:mean sea level",
+}
 
 VARIABLE_INFO = {
     "t2m": {"name": "2m Temperature", "unit": "°C", "cmap": "RdBu_r"},
@@ -32,7 +35,6 @@ VARIABLE_INFO = {
     "wind_speed": {"name": "Wind Speed", "unit": "m/s", "cmap": "YlOrRd"},
     "r2m": {"name": "Relative Humidity", "unit": "%", "cmap": "YlGn"},
     "msl": {"name": "Sea Level Pressure", "unit": "hPa", "cmap": "coolwarm"},
-    "d2m": {"name": "2m Dew Point", "unit": "°C", "cmap": "YlGn"},
 }
 
 PAKISTAN_CITIES = {
@@ -55,187 +57,171 @@ ALERT_THRESHOLDS = {
     "r2m": {"high": 95.0, "high_label": "Very High Humidity (>95%)", "low": 15.0, "low_label": "Very Dry Air (<15%)"},
 }
 
-# --- Cache ---
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
 
 
-def _get_cache_path(source_type, init_time, extra=""):
+def _get_cache_path(key):
     os.makedirs(CACHE_DIR, exist_ok=True)
-    key = f"{source_type}_{init_time}_{extra}"
-    filename = hashlib.md5(key.encode()).hexdigest() + ".nc"
-    return os.path.join(CACHE_DIR, filename)
+    return os.path.join(CACHE_DIR, hashlib.md5(key.encode()).hexdigest() + ".nc")
 
 
 # -----------------------------------------------------------
-# Subprocess-based fetching (avoids Streamlit event loop clash)
+# Direct HTTP fetch — no async, no S3, no event loop issues
 # -----------------------------------------------------------
 
-_FETCH_SCRIPT = '''
-import sys, json, numpy as np, xarray as xr
-import nest_asyncio
-nest_asyncio.apply()
+def _gfs_base_url(init_date, lead_hour):
+    return (
+        f"https://noaa-gfs-bdp-pds.s3.amazonaws.com/"
+        f"gfs.{init_date}/00/atmos/gfs.t00z.pgrb2.0p25.f{lead_hour:03d}"
+    )
 
-args = json.loads(sys.argv[1])
-source_type = args["source"]
-init_time = args["init_time"]
-lead_hours = args["lead_hours"]
-variables = args["variables"]
-output_path = args["output_path"]
-lat_max, lat_min = {lat_max}, {lat_min}
-lon_min, lon_max = {lon_min}, {lon_max}
 
-time_arr = np.array([np.datetime64(init_time)])
-lead_arr = np.array([np.timedelta64(h, "h") for h in lead_hours])
-var_arr = np.array(variables)
+def _fetch_idx(url):
+    """Download and parse GFS .idx index file to get byte offsets."""
+    req = urllib.request.Request(url + ".idx")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        lines = resp.read().decode("utf-8").strip().split("\n")
 
-if source_type == "gfs":
-    from earth2studio.data import GFS_FX
-    src = GFS_FX()
-    da = src(time=time_arr, lead_time=lead_arr, variable=var_arr)
-    da = da.sel(lat=slice(lat_max, lat_min), lon=slice(lon_min, lon_max))
-    datasets = {{}}
-    for v in variables:
-        try:
-            datasets[v] = da.sel(variable=v).drop_vars("variable")
-        except Exception:
-            pass
-    ds = xr.Dataset(datasets)
-    ds.to_netcdf(output_path)
-    print("OK")
+    entries = []
+    for line in lines:
+        parts = line.split(":")
+        if len(parts) >= 7:
+            entries.append({
+                "byte_start": int(parts[1]),
+                "key": f"{parts[3]}:{parts[4]}",
+            })
 
-elif source_type == "gefs":
-    from earth2studio.data import GEFS_FX
-    n_members = args.get("n_members", 5)
-    members = ["gec00"] + [f"gep{{i:02d}}" for i in range(1, n_members)]
-    member_list = []
-    for m in members:
-        try:
-            src = GEFS_FX(member=m)
-            da = src(time=time_arr, lead_time=lead_arr, variable=var_arr)
-            da = da.sel(lat=slice(lat_max, lat_min), lon=slice(lon_min, lon_max))
-            datasets = {{}}
-            for v in variables:
-                try:
-                    datasets[v] = da.sel(variable=v).drop_vars("variable")
-                except Exception:
-                    pass
-            member_list.append(xr.Dataset(datasets))
-        except Exception as e:
-            print(f"Skip {{m}}: {{e}}", file=sys.stderr)
-    if member_list:
-        combined = xr.concat(member_list, dim="member")
-        combined["member"] = np.arange(len(member_list))
-        combined.to_netcdf(output_path)
-        print("OK")
+    # Compute byte_end for each entry
+    for i in range(len(entries) - 1):
+        entries[i]["byte_end"] = entries[i + 1]["byte_start"] - 1
+    if entries:
+        entries[-1]["byte_end"] = None  # last goes to end
+    return entries
+
+
+def _download_variable(url, byte_start, byte_end):
+    """Download a single GRIB variable via HTTP Range request."""
+    if byte_end is None:
+        range_hdr = f"bytes={byte_start}-"
     else:
-        print("FAIL: no members fetched")
-        sys.exit(1)
-'''.format(lat_max=PK_LAT_MAX, lat_min=PK_LAT_MIN, lon_min=PK_LON_MIN, lon_max=PK_LON_MAX)
+        range_hdr = f"bytes={byte_start}-{byte_end}"
+    req = urllib.request.Request(url, headers={"Range": range_hdr})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return resp.read()
 
 
-def _run_fetch_subprocess(source_type, init_time, lead_hours, variables, n_members=5):
-    """Run Earth2Studio fetch in a subprocess to avoid event loop conflicts."""
-    with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
-        output_path = tmp.name
+def _parse_grib_to_subset(grib_bytes):
+    """Parse GRIB bytes and extract Pakistan region as numpy array."""
+    import pygrib
 
-    args_dict = {
-        "source": source_type,
-        "init_time": init_time,
-        "lead_hours": lead_hours,
-        "variables": variables,
-        "output_path": output_path,
-        "n_members": n_members,
-    }
-
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as script_f:
-        script_f.write(_FETCH_SCRIPT)
-        script_path = script_f.name
-
+    with tempfile.NamedTemporaryFile(suffix=".grib2", delete=False) as f:
+        f.write(grib_bytes)
+        tmp = f.name
     try:
-        result = subprocess.run(
-            [sys.executable, script_path, json.dumps(args_dict)],
-            capture_output=True, text=True, timeout=300,
-        )
-        if result.returncode == 0 and os.path.exists(output_path):
-            ds = xr.open_dataset(output_path)
-            return ds
-        else:
-            error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown error"
-            st.error(f"Fetch failed: {error_msg[-200:]}")
-            return None
-    except subprocess.TimeoutExpired:
-        st.error("Data fetch timed out (>5 min). Try a more recent date.")
-        return None
-    except Exception as e:
-        st.error(f"Fetch error: {e}")
-        return None
+        grbs = pygrib.open(tmp)
+        msg = grbs[1]
+        lats_2d, lons_2d = msg.latlons()
+        values = msg.values
+
+        lat_1d = lats_2d[:, 0]
+        lon_1d = lons_2d[0, :]
+
+        lat_mask = (lat_1d >= PK_LAT_MIN) & (lat_1d <= PK_LAT_MAX)
+        lon_mask = (lon_1d >= PK_LON_MIN) & (lon_1d <= PK_LON_MAX)
+
+        subset = values[np.ix_(lat_mask, lon_mask)]
+        grbs.close()
+        return subset, lat_1d[lat_mask], lon_1d[lon_mask]
     finally:
         try:
-            os.unlink(script_path)
+            os.unlink(tmp)
         except Exception:
             pass
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_gfs_forecast(init_time, lead_hours=None, variables=None):
-    if variables is None:
-        variables = GFS_VARIABLES
+    """Fetch GFS data via plain HTTP. No async. Works on Streamlit Cloud."""
     if lead_hours is None:
         lead_hours = [24]
+    if variables is None:
+        variables = list(GFS_IDX_PATTERNS.keys())
 
-    cache_path = _get_cache_path("gfs", init_time, f"h{'_'.join(map(str, lead_hours))}")
+    init_date = init_time.split("T")[0].replace("-", "")
+    cache_key = f"gfs_{init_date}_h{'_'.join(map(str, lead_hours))}_v{'_'.join(variables)}"
+    cache_path = _get_cache_path(cache_key)
+
     if os.path.exists(cache_path):
         try:
             return xr.open_dataset(cache_path)
         except Exception:
             pass
 
-    ds = _run_fetch_subprocess("gfs", init_time, lead_hours, variables)
-    if ds is not None:
+    all_data = {}
+    ref_lats = None
+    ref_lons = None
+
+    for lead_hr in lead_hours:
+        url = _gfs_base_url(init_date, lead_hr)
+
         try:
-            os.makedirs(CACHE_DIR, exist_ok=True)
-            ds.to_netcdf(cache_path)
-        except Exception:
-            pass
+            idx = _fetch_idx(url)
+        except Exception as e:
+            st.error(f"Cannot reach NOAA: {e}")
+            return None
+
+        for var_key in variables:
+            pattern = GFS_IDX_PATTERNS.get(var_key)
+            if not pattern:
+                continue
+
+            # Find matching entry in index
+            match = None
+            for entry in idx:
+                if entry["key"] == pattern:
+                    match = entry
+                    break
+            if match is None:
+                continue
+
+            try:
+                grib_bytes = _download_variable(url, match["byte_start"], match["byte_end"])
+                arr, lats, lons = _parse_grib_to_subset(grib_bytes)
+                if ref_lats is None:
+                    ref_lats = lats
+                    ref_lons = lons
+                all_data.setdefault(var_key, []).append(arr)
+            except Exception as e:
+                st.warning(f"Skip {var_key} +{lead_hr}h: {e}")
+
+    if not all_data or ref_lats is None:
+        st.error("No data could be fetched from NOAA.")
+        return None
+
+    lead_arr = np.array([np.timedelta64(h, "h") for h in lead_hours])
+    data_vars = {}
+    for var_key, arrays in all_data.items():
+        data_vars[var_key] = (["lead_time", "lat", "lon"], np.stack(arrays, axis=0))
+
+    ds = xr.Dataset(data_vars, coords={"lead_time": lead_arr, "lat": ref_lats, "lon": ref_lons})
+
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        ds.to_netcdf(cache_path)
+    except Exception:
+        pass
+
     return ds
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_gefs_ensemble(init_time, lead_hours=None, variables=None, n_members=5):
-    if variables is None:
-        variables = GEFS_VARIABLES
-    if lead_hours is None:
-        lead_hours = [24]
-
-    cache_path = _get_cache_path("gefs", init_time, f"m{n_members}_h{'_'.join(map(str, lead_hours))}")
-    if os.path.exists(cache_path):
-        try:
-            return xr.open_dataset(cache_path)
-        except Exception:
-            pass
-
-    ds = _run_fetch_subprocess("gefs", init_time, lead_hours, variables, n_members=n_members)
-    if ds is not None:
-        try:
-            os.makedirs(CACHE_DIR, exist_ok=True)
-            ds.to_netcdf(cache_path)
-        except Exception:
-            pass
-    return ds
-
-
-# --- Processing functions (unchanged) ---
+# --- Processing ---
 
 def convert_units(ds):
     result = ds.copy()
     if "t2m" in result:
         result["t2m"] = result["t2m"] - 273.15
-    if "tp" in result:
-        result["tp"] = result["tp"] * 1000
     if "msl" in result:
         result["msl"] = result["msl"] / 100
-    if "d2m" in result:
-        result["d2m"] = result["d2m"] - 273.15
     return result
 
 
@@ -280,8 +266,7 @@ def get_city_timeseries(ds_display, city_name, var_key):
         val = ds_display[var_key].sel(lat=lat, lon=lon, method="nearest").squeeze()
         if "lead_time" in val.dims:
             hours = [int(lt / np.timedelta64(1, "h")) for lt in val.lead_time.values]
-            values = val.values.tolist()
-            return hours, values
+            return hours, val.values.tolist()
     except Exception:
         pass
     return None, None
@@ -289,7 +274,7 @@ def get_city_timeseries(ds_display, city_name, var_key):
 
 def check_alerts(ds_display, lead_time_hr):
     alerts = []
-    for var, thresholds in ALERT_THRESHOLDS.items():
+    for var, th in ALERT_THRESHOLDS.items():
         if var not in ds_display:
             continue
         data = ds_display[var]
@@ -300,10 +285,10 @@ def check_alerts(ds_display, lead_time_hr):
             else:
                 data = data.isel(lead_time=0)
         data = data.squeeze()
-        max_val = float(data.max(skipna=True).values)
-        min_val = float(data.min(skipna=True).values)
-        if thresholds["high"] is not None and max_val > thresholds["high"]:
-            alerts.append(("error", thresholds["high_label"], f"Max: {max_val:.1f}"))
-        if thresholds["low"] is not None and min_val < thresholds["low"]:
-            alerts.append(("warning", thresholds["low_label"], f"Min: {min_val:.1f}"))
+        mx = float(data.max(skipna=True).values)
+        mn = float(data.min(skipna=True).values)
+        if th["high"] is not None and mx > th["high"]:
+            alerts.append(("error", th["high_label"], f"Max: {mx:.1f}"))
+        if th["low"] is not None and mn < th["low"]:
+            alerts.append(("warning", th["low_label"], f"Min: {mn:.1f}"))
     return alerts

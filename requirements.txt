@@ -5,10 +5,4 @@ matplotlib
 numpy
 scipy
 pandas
-earth2studio
-s3fs
-fsspec
 pygrib
-gcsfs
-zarr
-nest_asyncio
