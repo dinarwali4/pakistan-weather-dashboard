@@ -1,0 +1,13 @@
+streamlit
+xarray
+netCDF4
+matplotlib
+numpy
+scipy
+pandas
+earth2studio
+s3fs
+fsspec
+pygrib
+gcsfs
+zarr
