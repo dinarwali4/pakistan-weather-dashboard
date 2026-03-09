@@ -23,7 +23,7 @@ from earth2studio_fetch import (
 # =====================================================================
 st.set_page_config(
     layout="wide",
-    page_title="Pakistan Weather Dashboard",
+    page_title="RegenX.eco Geospatial Climate Model",
     page_icon="🇵🇰",
 )
 
@@ -139,8 +139,8 @@ button[data-baseweb="tab"] { font-weight:600 !important; }
 # =====================================================================
 st.markdown("""
 <div class="hdr">
-    <h1>🇵🇰 Pakistan Weather Dashboard</h1>
-    <p>Live GFS forecast &bull; 10 major cities &bull; NOAA data via direct HTTP</p>
+    <h1>🌍 RegenX.eco Geospatial Climate Model</h1>
+    <p>Seasonal Weather Forecast &bull; 10 major cities &bull; Live GFS data from NOAA</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -149,9 +149,9 @@ st.markdown("""
 # =====================================================================
 st.sidebar.markdown("""
 <div class="sb">
-    <div style="font-size:1.8rem;">🌦️</div>
-    <div class="t">Weather Dashboard</div>
-    <div class="s">Pakistan Forecast System</div>
+    <div style="font-size:1.8rem;">🌍</div>
+    <div class="t">RegenX.eco</div>
+    <div class="s">Geospatial Climate Model</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -601,6 +601,6 @@ if ds is not None:
     with st.expander("View Raw Dataset"):
         st.write(ds)
 
-    st.markdown('<div class="ft">Data: NOAA GFS via direct HTTP &bull; Region: Pakistan (24-37°N, 61-77°E) &bull; Built with Streamlit</div>', unsafe_allow_html=True)
+    st.markdown('<div class="ft">Created by <strong>RegenX.eco</strong> &bull; Data: NOAA GFS via direct HTTP &bull; Region: Pakistan (24-37°N, 61-77°E)</div>', unsafe_allow_html=True)
 elif data_source != "Upload NetCDF":
     st.warning("No data loaded. Please check your settings and internet connection.")
