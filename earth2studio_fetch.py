@@ -72,6 +72,8 @@ def _get_cache_path(source_type, init_time, extra=""):
 
 _FETCH_SCRIPT = '''
 import sys, json, numpy as np, xarray as xr
+import nest_asyncio
+nest_asyncio.apply()
 
 args = json.loads(sys.argv[1])
 source_type = args["source"]

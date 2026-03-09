@@ -11,3 +11,4 @@ fsspec
 pygrib
 gcsfs
 zarr
+nest_asyncio
